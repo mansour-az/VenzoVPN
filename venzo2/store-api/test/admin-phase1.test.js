@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { webcrypto } from 'node:crypto';
+import { runInNewContext } from 'node:vm';
+import { readFileSync } from 'node:fs';
 import { AdminState, adminState } from '../src/admin-state.js';
 import { phaseOneRouter, normalizeDocument, normalizeAnnouncements, publicManagedLines, totp } from '../src/admin-phase1.js';
 import { requireOwnerSession } from '../src/admin-phase1.js';
@@ -157,4 +159,50 @@ test('owner page ships parseable JS, restrictive CSP and no interpolated private
   assert.match(response.headers.get('content-security-policy'),/frame-ancestors 'none'/);
   assert.ok(!script.includes('innerHTML'));
   assert.ok(!html.includes('test-only-password'));
+});
+
+test('served login script boots, submits, shows rejection and opens dashboard', async () => {
+  const html = process.env.VENZO_ADMIN_HTML
+    ? readFileSync(process.env.VENZO_ADMIN_HTML, 'utf8')
+    : await (await phaseOneRouter(request('/admin'), {})).text();
+  let script = html.match(/<script nonce="[^"]+">([\s\S]*?)<\/script>/)[1];
+  // Exercise the same helper dependency introduced by Wrangler keepNames.
+  // VENZO_ADMIN_HTML additionally allows testing the actual deployed/bundled page.
+  if (!process.env.VENZO_ADMIN_HTML) script = script.replace('function ownerClient() {', 'function ownerClient() { __name(() => {}, "fixture");');
+  const elements = new Map();
+  const element = id => ({ id, hidden: false, value: id === 'period' ? '7' : '', textContent: '', handlers: {},
+    classList: { toggle() {} }, addEventListener(event, handler) { this.handlers[event] = handler; },
+    replaceChildren() {}, append() {}, reset() {}, setAttribute() {} });
+  for (const match of html.matchAll(/id="([^"]+)"/g)) elements.set(match[1], element(match[1]));
+  const calls = [];
+  let acceptLogin = false;
+  runInNewContext(script, {
+    document: { getElementById: id => elements.get(id), querySelectorAll: () => [], createElement: () => element('') },
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      if (url.endsWith('/session')) return { ok: false, status: 401, json: async () => ({ error: 'LOGIN_REQUIRED' }) };
+      if (url.endsWith('/login')) return { ok: acceptLogin, status: acceptLogin ? 200 : 401, json: async () => acceptLogin ? { authenticated: true } : { error: 'INVALID_CREDENTIALS' } };
+      return { ok: true, status: 200, json: async () => ({ days: [] }) };
+    },
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  const form = elements.get('loginForm');
+  assert.equal(typeof form.handlers.submit, 'function');
+  elements.get('secret').value = 'fixture-password';
+  elements.get('otp').value = '123456';
+  const submitter = element('submit');
+  const submit = () => form.handlers.submit({ preventDefault() {}, submitter, currentTarget: form });
+  await submit();
+  assert.equal(elements.get('message').hidden, false);
+  assert.match(elements.get('message').textContent, /نادرست/);
+  assert.equal(submitter.disabled, false);
+  const sent = calls.find(c => c.url.endsWith('/login'));
+  assert.equal(sent.options.method, 'POST');
+  assert.deepEqual(JSON.parse(sent.options.body), { secret: 'fixture-password', otp: '123456' });
+  acceptLogin = true;
+  await submit();
+  assert.equal(elements.get('app').hidden, false);
+  assert.equal(elements.get('login').hidden, true);
+  assert.equal(elements.get('secret').value, '');
+  assert.equal(elements.get('otp').value, '');
 });
